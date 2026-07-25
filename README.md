@@ -40,11 +40,16 @@ If your server has hardware without a Windows inbox driver (some NICs or storage
 
 In OVH Control Panel, **disable monitoring (interventions)**, set Netboot to **rescue (DEBIAN)** and reboot the server.
 
-### 2. Copy the script to the server
+### 2. Copy from your local machine to the server
 
-From your local machine (PowerShell, Terminal, etc.) :
+Copy the script :
 ```
 scp install_windows_ovh_mbr.sh root@YOUR_SERVER_IP:/root/
+```
+
+(RECOMMENDED) Copy your ISO :
+```
+scp "Path\To\Windows.iso" root@YOUR_SERVER_IP:/tmp/
 ```
 
 If SSH warns about a changed host key (common after reboot in rescue mode), run `ssh-keygen -R YOUR_SERVER_IP` to clear the old key and try again.
