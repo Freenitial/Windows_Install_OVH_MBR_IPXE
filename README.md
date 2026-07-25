@@ -2,8 +2,7 @@
 
 Bash script that installs Windows on an OVH dedicated server booted in rescue mode - **LEGACY BIOS ONLY**.
 
-Previous release 1.0 was tested on KIMSUFI KS-C using Windows Server 2025 ISO.
-This release 2.0 has NOT been fully tested for the moment
+Tested on KIMSUFI KS-C using Windows Server 2025 ISO.
 
 ## ⚠️ WARNING
 
@@ -39,7 +38,7 @@ If your server has hardware without a Windows inbox driver (some NICs or storage
 
 ### 1. Boot into rescue mode
 
-In OVH Control Panel, set Netboot to **rescue (DEBIAN)** and reboot the server.
+In OVH Control Panel, **disable monitoring (interventions)**, set Netboot to **rescue (DEBIAN)** and reboot the server.
 
 ### 2. Copy the script to the server
 
