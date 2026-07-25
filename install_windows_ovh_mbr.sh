@@ -5,7 +5,7 @@
 #  OVH Dedicated Server - MBR/Legacy      #
 ###########################################
 
-# v3.0
+# v3.3
 
 # HOW IT WORKS :
 # 1. Interactive wizard collects ALL configuration upfront (nothing destructive)
@@ -40,7 +40,7 @@
 # install-time checks are never executed. The registry bypass below is only
 # belt-and-suspenders for future in-place servicing.
 #
-# ACCOUNT MODEL (v3.0) :
+# ACCOUNT MODEL :
 # A named local Administrators-group account (the username you choose) is created
 # for EVERY edition, and AutoLogon targets it. This is deterministic and works
 # identically on client and Server, Core and Desktop Experience.
@@ -68,7 +68,10 @@
 # are not touched, but make sure OVH netboot targets the chosen disk.
 #
 # STRONGLY RECOMMENDED : run inside screen or tmux. If SSH drops mid-install
-# the process dies with a half-written disk.
+# the process dies with a half-written disk. The script offers to relaunch
+# itself inside tmux when you are not in a multiplexer.
+# NEVER launch it with '&' or nohup : it is an interactive wizard, and a
+# background job is stopped by the kernel the moment it asks a question.
 
 # USAGE :
 # scp install_windows_ovh_mbr.sh root@YOUR_IP:/root/
@@ -129,11 +132,14 @@ UNATTEND_TIMEZONE=""
 UNATTEND_COMPUTER_NAME="WIN-OVH"
 UNATTEND_USERNAME=""
 UNATTEND_PASSWORD=""
+UNATTEND_PRODUCT_KEY=""
 DRIVERS_DIR=""
 DRIVERS_INF_COUNT=0
 INJECT_DRIVERS_IN_WINPE=false
 CHOICE_INDEX=-1
 LETTERS="abcdefghijklmnopqrstuvwxyz"
+# Several file hosts serve an error page to the default wget/curl agent
+HTTP_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
 # Static keyboard layout list : InputLocale codes are stable across all Windows
 # versions, which avoids fragile registry extraction from the applied image.
@@ -180,6 +186,11 @@ RISKY_PCI_PATTERN='8086:(1572|1574|1580|1581|1583|1584|1585|158a|158b)|15b3:|10e
 ###########################################
 # Argument parsing
 ###########################################
+
+# Saved before the parsing loop consumes them : used to re-exec the script
+# inside tmux with the exact same arguments.
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -239,6 +250,116 @@ handle_error() {
     exit 1
 }
 
+cleanup_wizard_mounts() {
+    # Loop mounts left behind by an aborted run keep the ISO file busy and make
+    # the next run behave differently (wrong /tmp free space, stale mount).
+    mountpoint -q "$WIZARD_ISO_MOUNT" 2>/dev/null && umount -f "$WIZARD_ISO_MOUNT" 2>/dev/null || true
+    mountpoint -q /root/iso_check 2>/dev/null && umount -f /root/iso_check 2>/dev/null || true
+    rm -rf /root/iso_check 2>/dev/null || true
+}
+
+on_exit() {
+    local rc=$?
+    cleanup_wizard_mounts
+    exit "$rc"
+}
+trap on_exit EXIT
+
+###########################################
+# Interactive input helpers
+#
+# Every prompt reads from the controlling terminal (/dev/tty) rather than stdin,
+# so a redirected or exhausted stdin cannot silently abort the wizard (with
+# "set -e", a failing "read" exits the script without a word).
+# A background launch ("bash script &", nohup, ...) is also detected : without
+# this, the first prompt raises SIGTTIN, the script is Stopped, and everything
+# typed afterwards lands in the parent shell ("-bash: y: command not found").
+###########################################
+
+REPLY_LINE=""
+
+terminal_is_ours() {
+    # True when this process group owns the terminal (i.e. runs in foreground).
+    # If ps cannot tell us, assume foreground rather than waiting forever.
+    local pgid tpgid
+    pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    tpgid=$(ps -o tpgid= -p $$ 2>/dev/null | tr -d ' ')
+    [ -z "$pgid" ] || [ -z "$tpgid" ] || [ "$pgid" = "$tpgid" ]
+}
+
+ensure_terminal_ready() {
+    if ! { true >/dev/tty; } 2>/dev/null; then
+        log_error "No controlling terminal, but this script is an interactive wizard."
+        log_error "Run it directly in an SSH session (ideally inside tmux) - not via nohup, cron or a pipe."
+        exit 1
+    fi
+    local warned=false
+    while ! terminal_is_ours; do
+        if [ "$warned" = false ]; then
+            warned=true
+            {
+                echo
+                echo -e "${RED}This script runs in the BACKGROUND but needs keyboard input.${NC}"
+                echo -e "${YELLOW}Most likely cause : an UNQUOTED ISO URL. Every '&' in it started a${NC}"
+                echo -e "${YELLOW}background job and the URL was cut at the first '&'. In that case do${NC}"
+                echo -e "${YELLOW}NOT resume : kill this job and relaunch with the URL in single quotes :${NC}"
+                echo -e "${YELLOW}    bash '$SCRIPT_PATH' 'https://host/path?id=...&confirm=...'${NC}"
+                echo
+                echo -e "${YELLOW}Otherwise, type  fg  in this shell to bring it back (waiting...).${NC}"
+                echo -e "${YELLOW}Reminder : '&' does NOT protect the install from an SSH drop - tmux does.${NC}"
+            } >/dev/tty
+        fi
+        sleep 2
+    done
+}
+
+read_line() {
+    ensure_terminal_ready
+    REPLY_LINE=""
+    if ! IFS= read -r REPLY_LINE </dev/tty; then
+        echo
+        handle_error "Terminal input closed unexpectedly (EOF)"
+    fi
+    # A trailing CR can survive a paste from a Windows client and would silently
+    # corrupt a URL, a computer name or a product key
+    REPLY_LINE="${REPLY_LINE%$'\r'}"
+}
+
+read_secret() {
+    ensure_terminal_ready
+    REPLY_LINE=""
+    if ! IFS= read -rs REPLY_LINE </dev/tty; then
+        echo
+        handle_error "Terminal input closed unexpectedly (EOF)"
+    fi
+    echo
+}
+
+relaunch_in_multiplexer() {
+    # Re-exec this script (same arguments) inside a fresh tmux session
+    local cmd sess n
+    if ! command -v tmux >/dev/null 2>&1; then
+        log "Installing tmux..."
+        apt-get update >> "$LOG_FILE" 2>&1 || true
+        apt-get install -y tmux >> "$LOG_FILE" 2>&1 || true
+    fi
+    if ! command -v tmux >/dev/null 2>&1; then
+        log_error "tmux could not be installed. Answer y to continue without it, or install screen manually."
+        return 1
+    fi
+    cmd=$(printf '%q ' bash "$SCRIPT_PATH" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"})
+    sess="winsetup"
+    n=1
+    while tmux has-session -t "$sess" 2>/dev/null; do
+        sess="winsetup${n}"
+        n=$((n + 1))
+    done
+    log "Relaunching inside tmux session '$sess'"
+    log "Detach : Ctrl+B then D  |  Reattach : tmux attach -t $sess"
+    sleep 3
+    exec tmux new -s "$sess" "$cmd"
+}
+
 retry_command() {
     local cmd="$1"
     local description="${2:-command}"
@@ -278,6 +399,14 @@ cleanup_mounts() {
     fi
 }
 
+to_crlf() {
+    # Every file this script drops on a Windows/WinPE volume goes through here.
+    # cmd.exe needs CRLF : with LF-only endings, "goto <label>" fails with "The
+    # system cannot find the batch label specified" and parenthesised blocks are
+    # mis-parsed - both would only show up on a headless first boot.
+    sed -i 's/\r*$/\r/' "$1"
+}
+
 get_tmp_free_bytes() {
     df -B1 --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' ' || echo 0
 }
@@ -300,9 +429,9 @@ choose_from_menu() {
     echo
     while true; do
         echo -ne "${YELLOW}${prompt_text}${NC}"
-        local ans=""
-        read -r ans
-        ans=$(echo "$ans" | tr '[:upper:]' '[:lower:]')
+        read_line
+        local ans
+        ans=$(echo "$REPLY_LINE" | tr '[:upper:]' '[:lower:]')
         if [ -z "$ans" ] && [ "$default_index" -ge 0 ]; then
             CHOICE_INDEX=$default_index
             return 0
@@ -353,14 +482,128 @@ verify_iso() {
     [ "$iso_ok" = true ]
 }
 
+normalize_download_url() {
+    # Google Drive links exist in a dozen shapes but only the file id matters.
+    # Rebuilding the canonical direct-download URL repairs a share link
+    # (/file/d/<id>/view) and, above all, a Drive link truncated at the first '&'
+    # by an unquoted command line - the id always comes before it.
+    # A link that already carries "export=download" is left untouched : its
+    # at=/uuid= tokens are what authorize a non-public file, dropping them would
+    # turn a working URL into a login redirect.
+    local url="$1"
+    local id=""
+    local re_id='[?&]id=([A-Za-z0-9_-]{10,})'
+    local re_path='/d/([A-Za-z0-9_-]{10,})'
+    case "$url" in
+        *drive.google.com*|*drive.usercontent.google.com*|*docs.google.com*) ;;
+        *) echo "$url"; return 0 ;;
+    esac
+    case "$url" in
+        *export=download*) echo "$url"; return 0 ;;
+    esac
+    if [[ "$url" =~ $re_id ]]; then
+        id="${BASH_REMATCH[1]}"
+    elif [[ "$url" =~ $re_path ]]; then
+        id="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$id" ]; then
+        echo "https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t"
+        return 0
+    fi
+    echo "$url"
+}
+
+URL_CHECK_DIAG=""
+
+check_download_url() {
+    # Returns non-zero when the URL serves a web page (login form, anti-bot
+    # challenge, error page) instead of a file. Catching this here avoids
+    # downloading several GB of HTML and failing much later on ISO verification.
+    local url="$1"
+    URL_CHECK_DIAG=""
+    local out info code ctype eff
+    local fmt='__CURLINFO__|%{http_code}|%{content_type}|%{url_effective}\n'
+    out=$(curl -sIL -A "$HTTP_UA" -m 45 -w "$fmt" "$url" 2>/dev/null || true)
+    info=$(echo "$out" | grep '^__CURLINFO__' | tail -1 || true)
+    code=$(echo "$info" | cut -d'|' -f2)
+    # Many hosts refuse or mishandle HEAD : retry with a 1-byte ranged GET.
+    # The timeout caps the damage if the server ignores the Range header.
+    if [[ ! "$code" =~ ^2 ]]; then
+        local out_get info_get
+        out_get=$(curl -sL -A "$HTTP_UA" -m 45 -r 0-0 -D - -o /dev/null -w "$fmt" "$url" 2>/dev/null || true)
+        info_get=$(echo "$out_get" | grep '^__CURLINFO__' | tail -1 || true)
+        if [ -n "$info_get" ]; then
+            out="$out_get"
+            info="$info_get"
+            code=$(echo "$info" | cut -d'|' -f2)
+        fi
+    fi
+    if [ -z "$info" ]; then
+        URL_CHECK_DIAG="No HTTP response (dead link, DNS or network problem)"
+        return 1
+    fi
+    ctype=$(echo "$info" | cut -d'|' -f3)
+    eff=$(echo "$info" | cut -d'|' -f4)
+    case "$eff" in
+        *accounts.google.com*|*ServiceLogin*|*/signin*)
+            URL_CHECK_DIAG="Google redirects to a login page : file not shared publicly, or its at=/uuid= tokens are expired or refused from this server IP"
+            return 1
+            ;;
+    esac
+    if echo "$out" | grep -qi '^cf-mitigated:'; then
+        URL_CHECK_DIAG="Blocked by a Cloudflare anti-bot challenge : only a real browser can pass"
+        return 1
+    fi
+    case "$ctype" in
+        text/html*|application/xhtml*)
+            URL_CHECK_DIAG="The server returns a web page (HTTP ${code:-?}), not a file"
+            # Read the page title : Drive states its refusal there
+            # ("Quota exceeded", "Access denied"...), which is far more useful
+            # than a generic "not a file" message.
+            local title
+            # No Range here : some hosts answer a ranged request with raw file
+            # bytes instead of the page. --max-filesize keeps this bounded.
+            title=$(curl -sL -A "$HTTP_UA" -m 20 --max-filesize 2000000 "$url" 2>/dev/null | tr -d '\r\n' | grep -io '<title>[^<]*' | head -1 | cut -c8- || true)
+            [ -n "$title" ] && URL_CHECK_DIAG="$URL_CHECK_DIAG - the page says : \"$title\""
+            return 1
+            ;;
+    esac
+    if [ "$code" = "000" ]; then
+        URL_CHECK_DIAG="No response from the server (DNS, TLS or network problem)"
+        return 1
+    fi
+    if [[ ! "$code" =~ ^2 ]]; then
+        URL_CHECK_DIAG="HTTP $code returned by the server"
+        return 1
+    fi
+    return 0
+}
+
+explain_bad_url() {
+    log_error "$URL_CHECK_DIAG"
+    echo
+    echo -e "${YELLOW}  This link cannot be fetched from a server (no browser here).${NC}"
+    echo -e "  ${BLUE}Google Drive${NC} : share the file as 'Anyone with the link', then use"
+    echo -e "                 https://drive.usercontent.google.com/download?id=<FILE_ID>&export=download&confirm=t"
+    echo -e "                 (a private file works in your browser thanks to your session,"
+    echo -e "                  and Drive often refuses datacenter IPs like this server)"
+    echo -e "  ${BLUE}Drive 'Quota exceeded'${NC} : per-file download cap, reset can take up to 24h."
+    echo -e "                 Make a COPY of the file in your own Drive : the copy gets a new"
+    echo -e "                 file id, hence a fresh quota. Or use the scp route below."
+    echo -e "  ${BLUE}Cloudflare / anti-bot${NC} : host the ISO elsewhere, or copy it yourself :"
+    echo -e "                 scp your.iso root@<this_server>:/tmp/   then relaunch with NO url argument"
+    echo -e "  ${BLUE}Tip${NC} : pasting the URL at this prompt needs no quotes, unlike the command line."
+    echo
+}
+
 get_remote_size() {
     # Prints the remote file size in bytes, or 0 if unknown
     local url="$1"
     local size
-    size=$(curl -sLI "$url" | grep -i "Content-Length" | tail -1 | awk '{print $2}' | tr -d '\r' || echo 0)
+    size=$(curl -sLI -A "$HTTP_UA" "$url" | grep -i "Content-Length" | tail -1 | awk '{print $2}' | tr -d '\r' || echo 0)
     if ! [ "$size" -gt 0 ] 2>/dev/null; then
         # HEAD blocked : 1-byte range GET returns Content-Range with total size
-        size=$(curl -sL -r 0-0 -D - -o /dev/null "$url" | grep -i "Content-Range" | grep -oP '/\K[0-9]+' || echo 0)
+        size=$(curl -sL -A "$HTTP_UA" -r 0-0 -D - -o /dev/null "$url" | grep -i "Content-Range" | grep -oP '/\K[0-9]+' || echo 0)
     fi
     [ "$size" -gt 0 ] 2>/dev/null && echo "$size" || echo 0
 }
@@ -388,14 +631,22 @@ step_check_system() {
         echo
         log_warning "You are NOT running inside screen or tmux."
         log_warning "If your SSH session drops during the install, the process dies."
-        echo -ne "${YELLOW}Continue anyway ? (y/N) : ${NC}"
-        local tmux_answer=""
-        read -r tmux_answer
-        tmux_answer=$(echo "$tmux_answer" | tr '[:upper:]' '[:lower:]')
-        if [ "$tmux_answer" != "y" ]; then
-            echo -e "${GREEN}Good call. Run : tmux new -s win  (then relaunch this script)${NC}"
-            exit 0
-        fi
+        log_warning "Backgrounding it with '&' does NOT help : the wizard needs the keyboard."
+        while true; do
+            echo -ne "${YELLOW}[t] relaunch inside tmux (recommended) | [y] continue anyway | [n] abort (Enter) : ${NC}"
+            read_line
+            local tmux_answer
+            tmux_answer=$(echo "$REPLY_LINE" | tr '[:upper:]' '[:lower:]')
+            case "$tmux_answer" in
+                t) relaunch_in_multiplexer || true ;;
+                y) break ;;
+                n|"")
+                    echo -e "${GREEN}Good call. Run : tmux new -s win  (then relaunch this script)${NC}"
+                    exit 0
+                    ;;
+                *) echo -e "${RED}  Pick t, y or n.${NC}" ;;
+            esac
+        done
     fi
     log_success "System checks passed"
 }
@@ -422,6 +673,7 @@ step_install_packages() {
         "unzip"
         "pciutils"
         "util-linux"
+        "libxml2-utils"
     )
     for pkg in "${packages[@]}"; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
@@ -440,12 +692,33 @@ step_select_disk() {
     log "=== Step 3 : Target disk selection ==="
     local candidates=()
     local names=()
-    while read -r name size; do
-        candidates+=("/dev/${name}")
-        names+=("/dev/${name}  (${size})")
-    done < <(lsblk -dno NAME,SIZE,TYPE 2>/dev/null | awk '$3=="disk" {print $1" "$2}')
+    local skipped=0
+    # The OVH rescue system exposes 16 empty nbd* devices (plus loop/ram/zram
+    # ones) that lsblk reports as type "disk". Keep only real, non-empty media.
+    while read -r name size model; do
+        case "$name" in
+            nbd*|loop*|ram*|zram*|sr*|fd*|dm-*|md*)
+                skipped=$((skipped + 1))
+                continue
+                ;;
+        esac
+        local dev="/dev/${name}"
+        local bytes
+        bytes=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        if [ "${bytes:-0}" -le 0 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        candidates+=("$dev")
+        if [ -n "${model// /}" ]; then
+            names+=("${dev}  (${size})  ${model}")
+        else
+            names+=("${dev}  (${size})")
+        fi
+    done < <(lsblk -dno NAME,SIZE,TYPE,MODEL 2>/dev/null | awk '$3=="disk" {name=$1; size=$2; $1=""; $2=""; $3=""; sub(/^[[:space:]]+/, ""); print name" "size" "$0}')
+    [ "$skipped" -gt 0 ] && log "Ignored $skipped empty or virtual device(s) (nbd, loop, ram...)"
     if [ "${#candidates[@]}" -eq 0 ]; then
-        handle_error "No physical disk found"
+        handle_error "No usable physical disk found (empty and virtual devices are ignored)"
     fi
     if [ "${#candidates[@]}" -eq 1 ]; then
         DISK="${candidates[0]}"
@@ -484,6 +757,7 @@ step_resolve_iso() {
     SELECTED_EDITION_NAME=""
     while true; do
         local from_url=false
+        local reused=false
         if [ -n "$WINDOWS_ISO_URL" ]; then
             log "ISO URL : $WINDOWS_ISO_URL"
             from_url=true
@@ -508,17 +782,47 @@ step_resolve_iso() {
                 ISO_PATH="${iso_files[$CHOICE_INDEX]}"
                 USE_LOCAL_ISO=true
             else
+                echo -e "${BLUE}  Paste the URL as-is : no quotes needed here, unlike the command line.${NC}"
                 echo -ne "${YELLOW}Windows ISO download URL : ${NC}"
-                read -r WINDOWS_ISO_URL
+                read_line
+                WINDOWS_ISO_URL="$REPLY_LINE"
                 [ -z "$WINDOWS_ISO_URL" ] && { log_warning "Empty URL"; continue; }
                 from_url=true
             fi
         fi
         if [ "$from_url" = true ]; then
+            # Rebuild Drive links from their file id (also repairs a link cut at
+            # the first '&' by an unquoted command line)
+            local normalized
+            normalized=$(normalize_download_url "$WINDOWS_ISO_URL")
+            if [ "$normalized" != "$WINDOWS_ISO_URL" ]; then
+                WINDOWS_ISO_URL="$normalized"
+                log "Google Drive link rebuilt : $WINDOWS_ISO_URL"
+            fi
+            # Reject login pages / anti-bot challenges before downloading GBs
+            log "Checking the link..."
+            if ! check_download_url "$WINDOWS_ISO_URL"; then
+                explain_bad_url
+                WINDOWS_ISO_URL=""
+                continue
+            fi
             local remote_size
             remote_size=$(get_remote_size "$WINDOWS_ISO_URL")
+            # Resolve the /tmp target name FIRST : an aborted run may already have
+            # downloaded this ISO. That leftover file still occupies RAM-backed
+            # /tmp, so ignoring it made a relaunch wrongly conclude "too large for
+            # /tmp" and silently fall back to deferred mode.
+            local iso_filename
+            iso_filename=$(curl -sL -A "$HTTP_UA" -r 0-0 -D - -o /dev/null "$WINDOWS_ISO_URL" 2>/dev/null | grep -i "Content-Disposition" | grep -oP 'filename="\K[^"]+' || true)
+            [ -z "$iso_filename" ] && iso_filename="win.iso"
+            iso_filename="${iso_filename// /_}"
+            local tmp_target="/tmp/${iso_filename}"
+            local existing_size=0
+            [ -f "$tmp_target" ] && existing_size=$(stat -c%s "$tmp_target" 2>/dev/null || echo 0)
             local tmp_free
             tmp_free=$(get_tmp_free_bytes)
+            # Space available once the leftover file is replaced
+            local tmp_free_effective=$((tmp_free + existing_size))
             local margin=$((2 * 1024 * 1024 * 1024))
             if [ "$remote_size" -gt 0 ]; then
                 SETUP_SIZE_GIB=$((remote_size / 1024 / 1024 / 1024 + 2))
@@ -527,41 +831,54 @@ step_resolve_iso() {
                 SETUP_SIZE_GIB=25
                 log_warning "Could not determine ISO size, using default ${SETUP_SIZE_GIB} GiB setup partition"
             fi
-            if [ "$remote_size" -gt 0 ] && [ "$tmp_free" -gt $((remote_size + margin)) ]; then
-                # Enough space in /tmp (RAM-backed) : download NOW so the wizard
-                # can offer edition/language selection before anything destructive
-                log "Downloading ISO to /tmp (fits in RAM-backed storage)..."
-                local iso_filename
-                iso_filename=$(curl -sL -r 0-0 -D - -o /dev/null "$WINDOWS_ISO_URL" 2>/dev/null | grep -i "Content-Disposition" | grep -oP 'filename="\K[^"]+' || true)
-                [ -z "$iso_filename" ] && iso_filename="win.iso"
-                iso_filename="${iso_filename// /_}"
-                ISO_PATH="/tmp/${iso_filename}"
-                rm -f "$ISO_PATH"
-                if ! wget --progress=bar:force -O "$ISO_PATH" "$WINDOWS_ISO_URL" 2>&1; then
-                    log_error "Download failed"
-                    rm -f "$ISO_PATH"
-                    WINDOWS_ISO_URL=""
-                    continue
+            # Reuse a complete download left by a previous run instead of pulling
+            # several GB again (and instead of keeping two copies in RAM)
+            if [ "$existing_size" -gt 0 ] && { [ "$remote_size" -eq 0 ] || [ "$existing_size" -eq "$remote_size" ]; }; then
+                log "Previous download found : $tmp_target ($((existing_size / 1024 / 1024)) MB), verifying..."
+                if verify_iso "$tmp_target"; then
+                    ISO_PATH="$tmp_target"
+                    USE_LOCAL_ISO=true
+                    reused=true
+                    log_success "Reusing the already downloaded ISO (no re-download)"
+                else
+                    log_warning "Previous download is unusable, it will be replaced"
                 fi
-                USE_LOCAL_ISO=true
-            else
-                # ISO does not fit in /tmp : it will be downloaded to the Windows
-                # partition AFTER partitioning. Edition/language selection is deferred.
-                DEFERRED_ISO=true
-                log_warning "ISO too large for /tmp : download will happen after partitioning"
-                log_warning "Edition and language selection will occur after the download"
-                log_success "ISO source : $WINDOWS_ISO_URL (deferred download)"
-                return 0
+            fi
+            if [ "$reused" = false ]; then
+                if [ "$remote_size" -gt 0 ] && [ "$tmp_free_effective" -gt $((remote_size + margin)) ]; then
+                    # Enough space in /tmp (RAM-backed) : download NOW so the wizard
+                    # can offer edition/language selection before anything destructive
+                    log "Downloading ISO to /tmp (fits in RAM-backed storage)..."
+                    ISO_PATH="$tmp_target"
+                    rm -f "$ISO_PATH"
+                    if ! wget --progress=bar:force --user-agent="$HTTP_UA" -O "$ISO_PATH" "$WINDOWS_ISO_URL" 2>&1; then
+                        log_error "Download failed"
+                        rm -f "$ISO_PATH"
+                        WINDOWS_ISO_URL=""
+                        continue
+                    fi
+                    USE_LOCAL_ISO=true
+                else
+                    # ISO does not fit in /tmp : it will be downloaded to the Windows
+                    # partition AFTER partitioning. Edition/language selection is deferred.
+                    DEFERRED_ISO=true
+                    log_warning "ISO too large for /tmp : download will happen after partitioning"
+                    log_warning "Edition and language selection will occur after the download"
+                    log_success "ISO source : $WINDOWS_ISO_URL (deferred download)"
+                    return 0
+                fi
             fi
         fi
         # Verify integrity before letting the user configure anything
-        log "Verifying ISO integrity..."
-        if ! verify_iso "$ISO_PATH"; then
-            log_error "ISO is corrupted, truncated or not a Windows ISO : $ISO_PATH"
-            ISO_PATH=""
-            WINDOWS_ISO_URL=""
-            USE_LOCAL_ISO=false
-            continue
+        if [ "$reused" = false ]; then
+            log "Verifying ISO integrity..."
+            if ! verify_iso "$ISO_PATH"; then
+                log_error "ISO is corrupted, truncated or not a Windows ISO : $ISO_PATH"
+                ISO_PATH=""
+                WINDOWS_ISO_URL=""
+                USE_LOCAL_ISO=false
+                continue
+            fi
         fi
         local iso_size
         iso_size=$(stat -c%s "$ISO_PATH" 2>/dev/null || echo 0)
@@ -685,8 +1002,8 @@ wizard_select_keyboard() {
     else
         while true; do
             echo -ne "${YELLOW}InputLocale code (e.g. 040c:0000040c) : ${NC}"
-            local manual_code=""
-            read -r manual_code
+            read_line
+            local manual_code="$REPLY_LINE"
             if echo "$manual_code" | grep -qE '^[0-9a-fA-F]{4}:[0-9a-fA-F]{8}$'; then
                 UNATTEND_KEYBOARD_CODE="$manual_code"
                 UNATTEND_KEYBOARD_NAME="Custom ($manual_code)"
@@ -728,7 +1045,8 @@ wizard_select_timezone() {
     else
         while true; do
             echo -ne "${YELLOW}Windows time zone name (see 'tzutil /l') : ${NC}"
-            read -r UNATTEND_TIMEZONE
+            read_line
+            UNATTEND_TIMEZONE="$REPLY_LINE"
             [ -n "$UNATTEND_TIMEZONE" ] && break
             echo -e "${RED}  Cannot be empty.${NC}"
         done
@@ -740,14 +1058,45 @@ wizard_set_computer_name() {
     echo
     echo -e "${BLUE}── Computer name ──${NC}"
     echo -ne "  Computer name [${UNATTEND_COMPUTER_NAME}] (Enter = keep) : "
-    local comp_name=""
-    read -r comp_name
+    read_line
+    local comp_name="$REPLY_LINE"
     [ -z "$comp_name" ] && comp_name="$UNATTEND_COMPUTER_NAME"
     # Max 15 chars, alphanumeric and hyphens only
     comp_name=$(echo "$comp_name" | tr -cd 'A-Za-z0-9-' | head -c 15)
     [ -z "$comp_name" ] && comp_name="WIN-OVH"
     UNATTEND_COMPUTER_NAME="$comp_name"
     log "Computer name : $UNATTEND_COMPUTER_NAME"
+}
+
+wizard_set_product_key() {
+    # setup.exe is never executed by this script, so the windowsPE pass - the one
+    # that normally consumes the product key - never runs. On a VL image without
+    # an embedded PID, OOBE then stops at "It's time to enter the product key",
+    # which needs a KVM on a headless server. Declaring the key in the specialize
+    # pass is what actually skips that screen.
+    echo
+    echo -e "${BLUE}── Product key ──${NC}"
+    echo -e "  ${YELLOW}Without a key, first boot may stop at the OOBE product key screen${NC}"
+    echo -e "  ${YELLOW}and wait for a human : a blocker on a headless server.${NC}"
+    echo -e "  Use your own key, or the KMS client setup key (GVLK) Microsoft"
+    echo -e "  publishes for your edition."
+    while true; do
+        echo -ne "  Product key [Enter = none] : "
+        read_line
+        local key
+        key=$(echo "$REPLY_LINE" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+        if [ -z "$key" ]; then
+            UNATTEND_PRODUCT_KEY=""
+            log_warning "No product key : first boot may stop at the OOBE key screen"
+            return 0
+        fi
+        if echo "$key" | grep -qE '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$'; then
+            UNATTEND_PRODUCT_KEY="$key"
+            log "Product key : provided"
+            return 0
+        fi
+        echo -e "${RED}  Invalid format (expected XXXXX-XXXXX-XXXXX-XXXXX-XXXXX).${NC}"
+    done
 }
 
 wizard_set_account() {
@@ -758,9 +1107,9 @@ wizard_set_account() {
     echo -e "  ${YELLOW}This account is added to the Administrators group and used for RDP.${NC}"
     while true; do
         echo -ne "  Username to create : "
-        local input_username=""
-        read -r input_username
-        input_username=$(echo "$input_username" | tr -cd 'A-Za-z0-9_-' | head -c 20)
+        read_line
+        local input_username
+        input_username=$(echo "$REPLY_LINE" | tr -cd 'A-Za-z0-9_-' | head -c 20)
         # Avoid clashing with the built-in account name
         if [ -z "$input_username" ]; then
             echo -e "${RED}  Invalid or empty username (letters, numbers, _ and - only).${NC}"
@@ -775,17 +1124,17 @@ wizard_set_account() {
     done
     while true; do
         echo -ne "  Password (min 8 chars, required for RDP) : "
-        local input_password=""
-        read -rs input_password
-        echo
+        read_secret
+        local input_password="$REPLY_LINE"
+        REPLY_LINE=""
         if [ ${#input_password} -lt 8 ]; then
             echo -e "${RED}  Password too short (minimum 8 characters).${NC}"
             continue
         fi
         echo -ne "  Confirm password : "
-        local confirm_password=""
-        read -rs confirm_password
-        echo
+        read_secret
+        local confirm_password="$REPLY_LINE"
+        REPLY_LINE=""
         if [ "$input_password" != "$confirm_password" ]; then
             echo -e "${RED}  Passwords do not match.${NC}"
             continue
@@ -836,12 +1185,12 @@ wizard_setup_drivers() {
             return 0
         fi
         echo -ne "${YELLOW}Driver pack URL : ${NC}"
-        local drv_url=""
-        read -r drv_url
+        read_line
+        local drv_url="$REPLY_LINE"
         [ -z "$drv_url" ] && { echo -e "${RED}  Empty URL.${NC}"; continue; }
         rm -rf /tmp/driverpack /tmp/driverpack_archive
         mkdir -p /tmp/driverpack
-        if ! wget -q -O /tmp/driverpack_archive "$drv_url"; then
+        if ! wget -q --user-agent="$HTTP_UA" -O /tmp/driverpack_archive "$drv_url"; then
             log_error "Driver pack download failed"
             continue
         fi
@@ -868,6 +1217,22 @@ wizard_setup_drivers() {
     done
 }
 
+# Final destructive gate : explicit, disk named, single word to type.
+# Returns 0 only when the user typed ERASE exactly ; any other answer (including
+# a bare Enter, which is easy to hit by accident) goes back to the summary.
+confirm_erase() {
+    echo
+    echo -e "${RED}LAST CHANCE : ${DISK_LABEL} will be COMPLETELY ERASED.${NC}"
+    echo -ne "${YELLOW}Type ERASE to proceed (Enter or anything else = back to summary) : ${NC}"
+    read_line
+    if [ "$REPLY_LINE" = "ERASE" ]; then
+        return 0
+    fi
+    echo -e "${YELLOW}Not confirmed : back to the summary. Nothing was written to disk.${NC}"
+    echo -e "${YELLOW}(use q on the summary screen to quit)${NC}"
+    return 1
+}
+
 step_run_wizard() {
     log "=== Step 5 : Configuration wizard ==="
     echo
@@ -884,6 +1249,7 @@ step_run_wizard() {
     wizard_select_keyboard
     wizard_select_timezone
     wizard_set_computer_name
+    wizard_set_product_key
     wizard_set_account
     wizard_setup_drivers
     # Summary hub : confirm, or jump back to any single item
@@ -909,15 +1275,24 @@ step_run_wizard() {
         echo -e " ${GREEN}7)${NC} Computer name : $UNATTEND_COMPUTER_NAME"
         echo -e " ${GREEN}8)${NC} Account       : $UNATTEND_USERNAME (password set)"
         echo -e " ${GREEN}9)${NC} Drivers       : $drivers_line"
+        local key_line="none (OOBE may ask for it on first boot)"
+        [ -n "$UNATTEND_PRODUCT_KEY" ] && key_line="$UNATTEND_PRODUCT_KEY"
+        echo -e "${GREEN}10)${NC} Product key   : $key_line"
         echo -e "    RDP           : enabled, port 3389, firewall open"
         echo -e "${BLUE}╚════════════════════════════════════════════════════╝${NC}"
         echo
-        echo -ne "${YELLOW}Enter = confirm and install | 1-9 = edit item | q = quit : ${NC}"
-        local summary_choice=""
-        read -r summary_choice
-        summary_choice=$(echo "$summary_choice" | tr '[:upper:]' '[:lower:]')
+        echo -ne "${YELLOW}Enter = confirm and install | 1-10 = edit item | q = quit : ${NC}"
+        read_line
+        local summary_choice
+        summary_choice=$(echo "$REPLY_LINE" | tr '[:upper:]' '[:lower:]')
         case "$summary_choice" in
-            ""|y) break ;;
+            ""|y)
+                # The ERASE gate is part of the loop : failing it returns here
+                # instead of throwing away the whole configuration.
+                if confirm_erase; then
+                    break
+                fi
+                ;;
             q)
                 echo -e "${GREEN}Aborted. Nothing was written to disk.${NC}"
                 exit 0
@@ -950,19 +1325,10 @@ step_run_wizard() {
             7) wizard_set_computer_name ;;
             8) wizard_set_account ;;
             9) wizard_setup_drivers ;;
+            10) wizard_set_product_key ;;
             *) echo -e "${RED}Invalid choice.${NC}" ;;
         esac
     done
-    # Final destructive gate : explicit, disk named, single word to type
-    echo
-    echo -e "${RED}LAST CHANCE : ${DISK_LABEL} will be COMPLETELY ERASED.${NC}"
-    echo -ne "${YELLOW}Type ERASE to proceed (anything else aborts) : ${NC}"
-    local erase_confirm=""
-    read -r erase_confirm
-    if [ "$erase_confirm" != "ERASE" ]; then
-        echo -e "${GREEN}Aborted. Nothing was written to disk.${NC}"
-        exit 0
-    fi
     mountpoint -q "$WIZARD_ISO_MOUNT" 2>/dev/null && umount -f "$WIZARD_ISO_MOUNT" 2>/dev/null || true
     log_success "Configuration confirmed, starting installation"
 }
@@ -997,6 +1363,11 @@ step_prepare_disk() {
     local disk_mib=$((disk_bytes / 1024 / 1024))
     local setup_mib=$((SETUP_SIZE_GIB * 1024))
     local win_end_mib=$((disk_mib - setup_mib))
+    # A huge ISO on a small disk would leave Windows almost no room (or a
+    # negative size, which parted would happily turn into a mess)
+    if [ "$win_end_mib" -lt 25600 ]; then
+        handle_error "Windows partition would be only ${win_end_mib} MiB (setup partition needs ${setup_mib} MiB for the ISO). Use a bigger disk or a smaller ISO."
+    fi
     log "Creating MBR partition table (part1 : ${win_end_mib} MiB, part2 : ${setup_mib} MiB)..."
     parted "$DISK" --script --align optimal -- mklabel msdos
     parted "$DISK" --script --align optimal -- mkpart primary ntfs 1MiB "${win_end_mib}MiB"
@@ -1023,17 +1394,31 @@ step_download_iso() {
     while true; do
         mkdir -p /mnt
         mountpoint -q /mnt || mount -t ntfs-3g "$PART1" /mnt || handle_error "Failed to mount $PART1"
+        local normalized
+        normalized=$(normalize_download_url "$WINDOWS_ISO_URL")
+        if [ "$normalized" != "$WINDOWS_ISO_URL" ]; then
+            WINDOWS_ISO_URL="$normalized"
+            log "Google Drive link rebuilt : $WINDOWS_ISO_URL"
+        fi
+        if ! check_download_url "$WINDOWS_ISO_URL"; then
+            explain_bad_url
+            echo -ne "${YELLOW}New ISO URL (or Ctrl+C to abort) : ${NC}"
+            read_line
+            WINDOWS_ISO_URL="$REPLY_LINE"
+            continue
+        fi
         local iso_filename
-        iso_filename=$(curl -sL -r 0-0 -D - -o /dev/null "$WINDOWS_ISO_URL" 2>/dev/null | grep -i "Content-Disposition" | grep -oP 'filename="\K[^"]+' || true)
+        iso_filename=$(curl -sL -A "$HTTP_UA" -r 0-0 -D - -o /dev/null "$WINDOWS_ISO_URL" 2>/dev/null | grep -i "Content-Disposition" | grep -oP 'filename="\K[^"]+' || true)
         [ -z "$iso_filename" ] && iso_filename="win.iso"
         iso_filename="${iso_filename// /_}"
         ISO_PATH="/mnt/${iso_filename}"
         rm -f "$ISO_PATH"
-        if ! wget --progress=bar:force -O "$ISO_PATH" "$WINDOWS_ISO_URL" 2>&1; then
+        if ! wget --progress=bar:force --user-agent="$HTTP_UA" -O "$ISO_PATH" "$WINDOWS_ISO_URL" 2>&1; then
             log_error "Download failed"
             rm -f "$ISO_PATH"
             echo -ne "${YELLOW}New ISO URL (or Ctrl+C to abort) : ${NC}"
-            read -r WINDOWS_ISO_URL
+            read_line
+            WINDOWS_ISO_URL="$REPLY_LINE"
             continue
         fi
         log "Verifying downloaded ISO..."
@@ -1041,7 +1426,8 @@ step_download_iso() {
             log_error "Downloaded ISO is corrupted or not a Windows ISO"
             rm -f "$ISO_PATH"
             echo -ne "${YELLOW}New ISO URL (or Ctrl+C to abort) : ${NC}"
-            read -r WINDOWS_ISO_URL
+            read_line
+            WINDOWS_ISO_URL="$REPLY_LINE"
             continue
         fi
         log_success "Windows ISO downloaded and verified -> $ISO_PATH"
@@ -1066,472 +1452,8 @@ step_extract_iso() {
     if echo "$ISO_PATH" | grep -q "^/tmp/"; then
         rm -f "$ISO_PATH"
     fi
+    # Deferred mode downloads the ISO onto the Windows partition : its content is
+    # now on the setup partition, so drop it instead of leaving several GB of
+    # dead weight on C: forever.
     if echo "$ISO_PATH" | grep -q "^/mnt/"; then
-        umount -f /mnt 2>/dev/null || true
-    fi
-    # Copy driver pack to the setup partition for dism injection during first boot
-    if [ -n "$DRIVERS_DIR" ]; then
-        log "Copying driver pack to setup partition..."
-        mkdir -p /mnt2/Drivers
-        rsync -a "$DRIVERS_DIR"/ /mnt2/Drivers/ || handle_error "Failed to copy drivers"
-    fi
-    # Marker file : lets the WinPE script find this volume regardless of drive letter
-    date > /mnt2/ovh_setup.tag
-    # Verify critical files are present
-    for f in "/mnt2/bootmgr" "/mnt2/boot/bcd" "/mnt2/boot/boot.sdi" "/mnt2/sources/boot.wim" "/mnt2/sources/install.wim"; do
-        if [ ! -f "$f" ]; then
-            handle_error "Critical file missing on setup partition : $f"
-        fi
-    done
-    wiminfo /mnt2/sources/install.wim > /dev/null 2>&1 || handle_error "install.wim is corrupted"
-    log_success "Windows files extracted to setup partition"
-}
-
-###########################################
-# Step 9 : Apply Windows image
-###########################################
-
-step_apply_windows() {
-    log "=== Step 9 : Applying Windows image ==="
-    mountpoint -q /mnt2 || mount -t ntfs-3g "$PART2" /mnt2 || handle_error "Failed to mount $PART2"
-    # Deferred mode : edition/language were not selectable before download
-    if [ -z "$WIM_IMAGE_INDEX" ]; then
-        wizard_select_edition "/mnt2/sources/install.wim"
-        wizard_select_language "/mnt2/sources/install.wim"
-    fi
-    mountpoint -q /mnt && umount /mnt || true
-    log "Applying image $WIM_IMAGE_INDEX directly to $PART1 (this takes several minutes)..."
-    wimapply /mnt2/sources/install.wim "$WIM_IMAGE_INDEX" "$PART1" || handle_error "wimapply failed"
-    mkdir -p /mnt
-    mount -t ntfs-3g "$PART1" /mnt || handle_error "Failed to mount $PART1 after wimapply"
-    if [ ! -f "/mnt/Windows/System32/ntoskrnl.exe" ]; then
-        handle_error "Windows not found after wimapply"
-    fi
-    # Bypass Windows 11 install-time requirements (TPM, Secure Boot) as a
-    # safety net for future in-place servicing. Not strictly needed here because
-    # wimapply never runs setup.exe, so the checks never fire at install time.
-    local system_hive="/mnt/Windows/System32/config/SYSTEM"
-    if [ -f "$system_hive" ]; then
-        cat <<'REGBYPASS' > /tmp/w11bypass.reg
-Windows Registry Editor Version 5.00
-
-[HKEY_LOCAL_MACHINE\SYSTEM\Setup\MoSetup]
-"AllowUpgradesWithUnsupportedTPMOrCPU"=dword:00000001
-REGBYPASS
-        hivexregedit --merge --prefix 'HKEY_LOCAL_MACHINE\SYSTEM' "$system_hive" /tmp/w11bypass.reg 2>/dev/null && \
-            log "Windows 11 requirements bypass injected into SYSTEM hive" || \
-            log_warning "Could not inject W11 bypass (non-critical for Server/W10)"
-        rm -f /tmp/w11bypass.reg
-    fi
-    log_success "Windows image applied to $PART1 (edition : $SELECTED_EDITION_NAME)"
-}
-
-###########################################
-# Step 10 : Configure unattend + RDP
-# No user interaction here : everything comes from the wizard variables.
-###########################################
-
-step_configure_unattend() {
-    log "=== Step 10 : Configuring unattended setup + RDP ==="
-    mountpoint -q /mnt || mount -t ntfs-3g "$PART1" /mnt || handle_error "Failed to mount $PART1"
-    # Escape password for safe XML insertion
-    local xml_password="$UNATTEND_PASSWORD"
-    xml_password="${xml_password//&/&amp;}"
-    xml_password="${xml_password//</&lt;}"
-    xml_password="${xml_password//>/&gt;}"
-    xml_password="${xml_password//\"/&quot;}"
-    xml_password="${xml_password//\'/&apos;}"
-    # Escape for sed replacement (backslash, & and delimiter are special)
-    local sed_password="${xml_password//\\/\\\\}"
-    sed_password="${sed_password//&/\\&}"
-    sed_password="${sed_password//|/\\|}"
-    mkdir -p /mnt/Windows/Panther
-    # Single template. A named local admin account is created and AutoLogon
-    # targets it. The __ADMINPW__ marker is replaced by an AdministratorPassword
-    # block on Server (needed for the Server OOBE screen) and removed otherwise.
-    cat <<'UNATTENDEOF' > /mnt/Windows/Panther/unattend.xml
-<?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
-  <settings pass="specialize">
-    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <ComputerName>__COMPUTER_NAME__</ComputerName>
-      <TimeZone>__TIMEZONE__</TimeZone>
-    </component>
-    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <fDenyTSConnections>false</fDenyTSConnections>
-    </component>
-    <component name="Microsoft-Windows-TerminalServices-RDP-WinStationExtensions" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <UserAuthentication>0</UserAuthentication>
-    </component>
-    <component name="Networking-MPSSVC-Svc" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-      <FirewallGroups>
-        <FirewallGroup wcm:action="add" wcm:keyValue="rdp">
-          <Active>true</Active>
-          <Group>@FirewallAPI.dll,-28752</Group>
-          <Profile>all</Profile>
-        </FirewallGroup>
-      </FirewallGroups>
-    </component>
-  </settings>
-  <settings pass="oobeSystem">
-    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-      <OOBE>
-        <HideEULAPage>true</HideEULAPage>
-        <HideLocalAccountScreen>true</HideLocalAccountScreen>
-        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
-        <ProtectYourPC>3</ProtectYourPC>
-      </OOBE>
-      <UserAccounts>
-        <LocalAccounts>
-          <LocalAccount wcm:action="add">
-            <Name>__USERNAME__</Name>
-            <DisplayName>__USERNAME__</DisplayName>
-            <Group>Administrators</Group>
-            <Password>
-              <Value>__PASSWORD__</Value>
-              <PlainText>true</PlainText>
-            </Password>
-          </LocalAccount>
-        </LocalAccounts>
-__ADMINPW__
-      </UserAccounts>
-      <AutoLogon>
-        <Enabled>true</Enabled>
-        <LogonCount>1</LogonCount>
-        <Username>__USERNAME__</Username>
-        <Password>
-          <Value>__PASSWORD__</Value>
-          <PlainText>true</PlainText>
-        </Password>
-      </AutoLogon>
-    </component>
-    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <InputLocale>__KEYBOARD__</InputLocale>
-      <SystemLocale>__LOCALE__</SystemLocale>
-      <UILanguage>__LOCALE__</UILanguage>
-      <UserLocale>__LOCALE__</UserLocale>
-    </component>
-  </settings>
-</unattend>
-UNATTENDEOF
-    # Server : mirror the password to the built-in Administrator (satisfies the
-    # Server first-boot password screen). Client : remove the marker line.
-    if [ "$IS_SERVER_EDITION" = true ]; then
-        cat <<'ADMINPWEOF' > /tmp/adminpw.xml
-        <AdministratorPassword>
-          <Value>__PASSWORD__</Value>
-          <PlainText>true</PlainText>
-        </AdministratorPassword>
-ADMINPWEOF
-        sed -i -e '/__ADMINPW__/{r /tmp/adminpw.xml' -e 'd}' /mnt/Windows/Panther/unattend.xml
-        rm -f /tmp/adminpw.xml
-    else
-        sed -i '/__ADMINPW__/d' /mnt/Windows/Panther/unattend.xml
-    fi
-    sed -i \
-        -e "s|__COMPUTER_NAME__|${UNATTEND_COMPUTER_NAME}|g" \
-        -e "s|__TIMEZONE__|${UNATTEND_TIMEZONE}|g" \
-        -e "s|__USERNAME__|${UNATTEND_USERNAME}|g" \
-        -e "s|__PASSWORD__|${sed_password}|g" \
-        -e "s|__KEYBOARD__|${UNATTEND_KEYBOARD_CODE}|g" \
-        -e "s|__LOCALE__|${UNATTEND_LOCALE}|g" \
-        /mnt/Windows/Panther/unattend.xml
-    log_success "unattend.xml created (OOBE skip + ${UNATTEND_USERNAME} account + RDP + firewall + timezone)"
-    # SetupComplete.cmd : runs as SYSTEM before first interactive login.
-    # NOTE : ignored by some OEM-activated Desktop images, which is why RDP +
-    # firewall are ALSO configured in unattend.xml above (belt and braces).
-    mkdir -p /mnt/Windows/Setup/Scripts
-    cat <<'SETUPEOF' > /mnt/Windows/Setup/Scripts/SetupComplete.cmd
-@echo off
-:: Enable Remote Desktop and disable NLA requirement
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f
-:: Open firewall for RDP (TCP 3389)
-netsh advfirewall firewall add rule name="Remote Desktop (TCP-In)" dir=in action=allow protocol=TCP localport=3389
-:: Enable ICMP (ping) for remote diagnostics
-netsh advfirewall firewall add rule name="ICMP Allow" dir=in action=allow protocol=ICMPv4
-:: Set all connected network adapters to Private profile
-powershell -ExecutionPolicy Bypass -Command "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $prof = Get-NetConnectionProfile -InterfaceAlias $_.Name -ErrorAction SilentlyContinue; if ($prof -and $prof.NetworkCategory -ne 'Private' -and $prof.NetworkCategory -ne 'DomainAuthenticated') { Set-NetConnectionProfile -InterfaceAlias $_.Name -NetworkCategory Private -ErrorAction SilentlyContinue } }"
-:: Disable password expiration (prevents RDP lockout on headless servers)
-net accounts /maxpwage:unlimited
-:: Set power plan to high performance (prevent sleep on dedicated server)
-powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-:: Disable hibernation (reclaim disk space)
-powercfg /hibernate off
-:: Disable Ctrl+Alt+Del requirement for login
-reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableCAD /t REG_DWORD /d 1 /f
-:: Remove plaintext password from unattend.xml (persists after install)
-del /f /q "%WINDIR%\Panther\unattend.xml" >nul 2>&1
-del /f /q "%WINDIR%\Panther\Unattend\unattend.xml" >nul 2>&1
-del /f /q "%SYSTEMDRIVE%\unattend.xml" >nul 2>&1
-:: Disable automatic restart after Windows Update
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoRebootWithLoggedOnUsers /t REG_DWORD /d 1 /f
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v AUOptions /t REG_DWORD /d 3 /f
-SETUPEOF
-    log_success "SetupComplete.cmd created"
-}
-
-###########################################
-# Step 11 : Inject auto-bcdboot + drivers into WinPE
-###########################################
-
-step_inject_winpe() {
-    log "=== Step 11 : Injecting auto-bcdboot + drivers into WinPE ==="
-    mountpoint -q /mnt2 || mount -t ntfs-3g "$PART2" /mnt2 || handle_error "Failed to mount $PART2"
-    # WinPE startup script :
-    # 1. Loads user drivers into the running WinPE (a hidden storage controller
-    #    needs this before the disk is even visible)
-    # 2. Locates the Windows volume and the setup volume (by marker file)
-    # 3. Injects user drivers into the installed Windows via dism /Add-Driver
-    #    /ForceUnsigned (proper registration, incl. boot-critical storage drivers)
-    # 4. Creates boot files with bcdboot
-    # 5. Deletes the setup partition and extends the Windows partition. Selecting
-    #    the volume first also selects the correct disk (safe on multi-disk).
-    cat <<'BCDSCRIPT' > /tmp/startnet.cmd
-@echo off
-echo ============================================
-echo  Automated first boot - finalizing Windows
-echo ============================================
-echo.
-wpeinit
-ping -n 2 127.0.0.1 >nul
-if exist X:\Drivers (
-    echo Loading drivers into WinPE...
-    for /r X:\Drivers %%d in (*.inf) do drvload "%%d" >nul 2>&1
-)
-set WINDRIVE=
-set SETUPDRIVE=
-for %%l in (C D E F G H I J) do (
-    if exist %%l:\Windows\System32\ntoskrnl.exe set WINDRIVE=%%l:
-    if exist %%l:\ovh_setup.tag set SETUPDRIVE=%%l:
-)
-if not defined WINDRIVE goto notfound
-echo Found Windows on %WINDRIVE%
-if defined SETUPDRIVE (
-    if exist %SETUPDRIVE%\Drivers (
-        echo Injecting drivers into the installed Windows...
-        dism /Image:%WINDRIVE%\ /Add-Driver /Driver:%SETUPDRIVE%\Drivers /Recurse /ForceUnsigned
-        if errorlevel 1 echo WARNING : some drivers failed to inject, continuing anyway
-    )
-)
-bcdboot %WINDRIVE%\Windows /s %WINDRIVE% /f BIOS
-if errorlevel 1 goto bcdfail
-echo Boot files created.
-echo Removing setup partition and extending Windows partition...
-(echo select volume %WINDRIVE:~0,1%
-echo select partition 2
-echo delete partition override
-echo select partition 1
-echo extend)> X:\diskpart.txt
-diskpart /s X:\diskpart.txt
-echo Done. Rebooting in 10 seconds...
-ping -n 10 127.0.0.1 >nul
-wpeutil reboot
-goto eof
-:notfound
-echo ERROR : Windows not found on any drive.
-cmd /k
-goto eof
-:bcdfail
-echo ERROR : bcdboot failed.
-cmd /k
-:eof
-BCDSCRIPT
-    cat <<'WINPESHL' > /tmp/winpeshl.ini
-[LaunchApps]
-%SYSTEMROOT%\System32\cmd.exe, /c %SYSTEMROOT%\System32\startnet.cmd
-WINPESHL
-    # The setup image is always the LAST image in boot.wim
-    # (index 1 on single-image ISOs, index 2 on standard Microsoft ISOs).
-    # Verified against fr-FR Windows 11 25H2 and Server 2025 ISOs.
-    local boot_wim_last
-    boot_wim_last=$(wiminfo /mnt2/sources/boot.wim | awk '/^Image Count:/{print $3}')
-    [ -z "$boot_wim_last" ] && boot_wim_last=1
-    # Decide whether drivers also go inside boot.wim (loaded entirely in RAM,
-    # so oversized packs are excluded ; dism injection from part2 still happens)
-    INJECT_DRIVERS_IN_WINPE=false
-    if [ -n "$DRIVERS_DIR" ]; then
-        local drv_size
-        drv_size=$(du -sb "$DRIVERS_DIR" 2>/dev/null | awk '{print $1}')
-        if [ "${drv_size:-0}" -le $((512 * 1024 * 1024)) ]; then
-            INJECT_DRIVERS_IN_WINPE=true
-        else
-            log_warning "Driver pack larger than 512 MiB : skipping WinPE (RAM) injection, dism injection still applies"
-        fi
-    fi
-    log "Modifying boot.wim image ${boot_wim_last}..."
-    cp /mnt2/sources/boot.wim /tmp/boot_modified.wim || handle_error "Failed to copy boot.wim"
-    chmod 644 /tmp/boot_modified.wim
-    {
-        echo "add /tmp/startnet.cmd /Windows/System32/startnet.cmd"
-        echo "add /tmp/winpeshl.ini /Windows/System32/winpeshl.ini"
-        if [ "$INJECT_DRIVERS_IN_WINPE" = true ]; then
-            echo "add \"$DRIVERS_DIR\" /Drivers"
-        fi
-    } | wimupdate /tmp/boot_modified.wim "$boot_wim_last" >> "$LOG_FILE" 2>&1 || \
-        handle_error "Failed to inject into boot.wim"
-    cp /tmp/boot_modified.wim /mnt2/sources/boot.wim || handle_error "Failed to write modified boot.wim"
-    rm -f /tmp/boot_modified.wim /tmp/startnet.cmd /tmp/winpeshl.ini
-    log_success "Auto-bcdboot injected into WinPE image ${boot_wim_last} (drivers in WinPE : ${INJECT_DRIVERS_IN_WINPE})"
-}
-
-###########################################
-# Step 12 : Install GRUB2 + wimboot
-###########################################
-
-step_install_grub() {
-    log "=== Step 12 : Installing GRUB2 + wimboot ==="
-    mountpoint -q /mnt || mount -t ntfs-3g "$PART1" /mnt || handle_error "Failed to mount $PART1"
-    mountpoint -q /mnt2 || mount -t ntfs-3g "$PART2" /mnt2 || handle_error "Failed to mount $PART2"
-    # Copy boot files to part1 (persist after part2 deletion)
-    mkdir -p /mnt/Boot
-    cp /mnt2/boot/boot.sdi /mnt/Boot/boot.sdi
-    log "Downloading wimboot..."
-    retry_command "wget -q -O /mnt/Boot/wimboot '$WIMBOOT_URL' >> $LOG_FILE 2>&1" "download wimboot" || handle_error "Failed to download wimboot"
-    cp /mnt/Boot/wimboot /mnt2/boot/wimboot
-    log_success "wimboot installed"
-    # Install GRUB2 to MBR with boot directory on part1 (survives part2 deletion).
-    # core.img lives in the MBR embedding gap (the 1 MiB before part1), not part2.
-    mkdir -p /mnt/boot/grub
-    local grub_ok=false
-    local methods=(
-        "grub-install --target=i386-pc --boot-directory=/mnt/boot --force --recheck $DISK"
-        "grub-install --boot-directory=/mnt/boot --force $DISK"
-    )
-    for method in "${methods[@]}"; do
-        log "Trying : $method"
-        if eval "$method" >> "$LOG_FILE" 2>&1; then
-            grub_ok=true
-            log_success "GRUB2 installed"
-            break
-        fi
-    done
-    if [ "$grub_ok" = false ]; then
-        handle_error "GRUB2 installation failed"
-    fi
-    # Single GRUB entry with auto-detection. hd0 is the disk GRUB was installed on.
-    # Boot/BCD present on part1 -> boot installed Windows
-    # Boot/BCD absent on part1 -> boot WinPE from part2 (first boot only)
-    cat <<'GRUBCFG' > /mnt/boot/grub/grub.cfg
-set timeout=3
-set default=0
-menuentry "Windows" {
-    insmod ntfs
-    if [ -f (hd0,msdos1)/Boot/BCD ]; then
-        set root=(hd0,msdos1)
-        linux16 /Boot/wimboot
-        initrd16 newc:bootmgr:/bootmgr newc:bcd:/Boot/BCD newc:boot.sdi:/Boot/boot.sdi
-    else
-        set root=(hd0,msdos2)
-        linux16 /boot/wimboot
-        initrd16 newc:bootmgr:/bootmgr newc:bcd:/boot/bcd newc:boot.sdi:/boot/boot.sdi newc:boot.wim:/sources/boot.wim
-    fi
-    boot
-}
-GRUBCFG
-    if [ ! -f "/mnt/boot/grub/grub.cfg" ]; then
-        handle_error "Failed to create grub.cfg"
-    fi
-    log_success "GRUB2 configured with auto-detect entry"
-}
-
-###########################################
-# Final Verification
-###########################################
-
-step_finalize() {
-    log "=== Final verification ==="
-    mountpoint -q /mnt || mount -t ntfs-3g "$PART1" /mnt 2>/dev/null || true
-    mountpoint -q /mnt2 || mount -t ntfs-3g "$PART2" /mnt2 2>/dev/null || true
-    log "Windows partition ($PART1) :"
-    for f in "/mnt/Windows/System32/ntoskrnl.exe" "/mnt/Boot/wimboot" "/mnt/Boot/boot.sdi" "/mnt/boot/grub/grub.cfg" "/mnt/Windows/Panther/unattend.xml" "/mnt/Windows/Setup/Scripts/SetupComplete.cmd"; do
-        if [ -f "$f" ]; then
-            log "  OK : $f"
-        else
-            log_warning "  MISSING : $f"
-        fi
-    done
-    log "Setup partition ($PART2, auto-deleted on first boot) :"
-    for f in "/mnt2/boot/wimboot" "/mnt2/bootmgr" "/mnt2/boot/bcd" "/mnt2/boot/boot.sdi" "/mnt2/sources/boot.wim" "/mnt2/ovh_setup.tag"; do
-        if [ -f "$f" ]; then
-            log "  OK : $f"
-        else
-            log_warning "  MISSING : $f"
-        fi
-    done
-    if [ -n "$DRIVERS_DIR" ]; then
-        if [ -d "/mnt2/Drivers" ]; then
-            log "  OK : /mnt2/Drivers ($DRIVERS_INF_COUNT .inf)"
-        else
-            log_warning "  MISSING : /mnt2/Drivers"
-        fi
-    fi
-    fdisk -l "$DISK" 2>/dev/null | grep "^${DISK}" | while read -r line; do
-        log "  $line"
-    done
-    sync
-    umount -f /mnt 2>/dev/null || true
-    umount -f /mnt2 2>/dev/null || true
-    log_success "All verifications passed"
-}
-
-###########################################
-# Main
-###########################################
-
-main() {
-    clear
-    echo -e "${BLUE}=====================================================${NC}"
-    echo -e "${BLUE}  Windows Installation - OVH Dedicated Server        ${NC}"
-    echo -e "${BLUE}  MBR/Legacy BIOS - wimapply + wimboot - v3.0        ${NC}"
-    echo -e "${BLUE}=====================================================${NC}"
-    echo
-    echo "=== Installation started at $(date) ===" >> "$LOG_FILE"
-    mkdir -p "$BACKUP_DIR"
-    step_check_system
-    step_install_packages
-    step_select_disk
-    step_resolve_iso
-    step_run_wizard
-    step_prepare_disk
-    step_download_iso
-    step_extract_iso
-    step_apply_windows
-    step_configure_unattend
-    step_inject_winpe
-    step_install_grub
-    step_finalize
-    local server_ip
-    server_ip=$(ip -4 addr show scope global | grep -oP 'inet \K[0-9.]+' | head -1 || echo "<server_ip>")
-    echo
-    echo -e "${GREEN}=====================================================${NC}"
-    echo -e "${GREEN}  Installation complete!                              ${NC}"
-    echo -e "${GREEN}=====================================================${NC}"
-    echo
-    echo -e "${YELLOW}WHAT HAPPENS NEXT :${NC}"
-    echo -e "  ${BLUE}1.${NC} Go to OVH Control Panel"
-    echo -e "  ${BLUE}2.${NC} Change Netboot to ${GREEN}'Boot from hard disk'${NC}"
-    echo -e "  ${BLUE}3.${NC} Reboot the server"
-    echo -e "  ${BLUE}4.${NC} ${YELLOW}Wait ~5-15 minutes${NC} (two automatic reboots will happen)"
-    echo -e "     - 1st boot : WinPE injects drivers, creates boot files, reboots"
-    echo -e "     - 2nd boot : Windows finishes setup (OOBE skipped)"
-    echo
-    echo -e "${YELLOW}THEN CONNECT VIA RDP (mstsc /v:${server_ip}) :${NC}"
-    echo -e "  User     : ${GREEN}${UNATTEND_USERNAME}${NC}"
-    echo -e "  Password : ${GREEN}(the one you set in the wizard)${NC}"
-    echo
-    echo -e "${YELLOW}TROUBLESHOOTING :${NC}"
-    echo -e "  - Can't connect? Wait a few more minutes, Windows may still be configuring"
-    echo -e "  - Still nothing after 20 min? Reboot from OVH panel and try again"
-    echo -e "  - Never reachable? Suspect a missing NIC driver : reboot in rescue mode,"
-    echo -e "    rerun this script and inject the vendor driver pack when asked"
-    echo
-    echo -e "Full log : $LOG_FILE"
-    echo
-    echo -e "Press any key to reboot, Ctrl+C to cancel..."
-    read -n 1 -s -r
-    reboot
-}
-
-main
+        log "Remov
